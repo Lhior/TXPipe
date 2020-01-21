@@ -5,6 +5,7 @@ from .utils.metacal import metacal_variants, metacal_band_variants
 import numpy as np
 import warnings
 
+
 class TXSelector(PipelineStage):
     """
     This pipeline stage selects objects to be used
@@ -86,22 +87,6 @@ class TXSelector(PipelineStage):
         # Build a classifier used to put objects into tomographic bins
         classifier, features = self.build_tomographic_classifier()        
 
-        # Columns we need from the photometry data.
-        # We use the photometry data to select the lenses.
-        # Although this will be one by redmagic soon.
-        phot_cols = ['g_mag', 'r_mag', 'i_mag']
-
-        # Columns we need from the shear catalog
-        shear_cols = ['mcal_flags', 'mcal_psf_T_mean']
-        shear_cols += metacal_band_variants(bands, 'mcal_mag', 'mcal_mag_err')
-        shear_cols += metacal_variants('mcal_T', 'mcal_s2n', 'mcal_g1', 'mcal_g2')
-
-        # Input data.  These are iterators - they lazily load chunks
-        # of the data one by one later when we do the for loop.
-        # This code can be run in parallel, and different processes will
-        # each get different chunks of the data 
-        iter_shear = self.iterate_hdf('shear_catalog', 'metacal', shear_cols, chunk_rows)
-        iter_phot = self.iterate_hdf('photometry_catalog', 'photometry', phot_cols, chunk_rows)
 
 
         # We will collect the selection biases for each bin
@@ -115,11 +100,11 @@ class TXSelector(PipelineStage):
 
 
         # Loop through the input data, processing it chunk by chunk
-        for (start, end, shear_data), (_, _, phot_data) in zip(iter_shear, iter_phot):
+        for data in self.load_data_chunks():
             print(f"Process {self.rank} running selection for rows {start:,}-{end:,}")
 
             # Select most likely tomographic source bin
-            pz_data = self.apply_classifier(classifier, features, shear_data)
+            self.apply_classifier(classifier, features, data)
 
             # Combine this selection with size and snr cuts to produce a source selection
             # and calculate the shear bias it would generate
@@ -149,6 +134,39 @@ class TXSelector(PipelineStage):
         # Restore the original warning settings in case we are being called from a library
         np.seterr(**original_warning_settings)
 
+    def load_inputs(self):
+
+        # Shear columns we will need, including all the metacal ones
+        bands = self.config['bands']
+        shear_cols = ['mcal_flags', 'mcal_psf_T_mean']
+        shear_cols += metacal_band_variants(bands, 'mcal_mag', 'mcal_mag_err')
+        shear_cols += metacal_variants('mcal_T', 'mcal_s2n', 'mcal_g1', 'mcal_g2')
+
+        # Columns we need from the photometry data.
+        # We use the photometry data to select the lenses.
+        # Although this will be one by redmagic soon.
+        phot_cols = ['g_mag', 'r_mag', 'i_mag']
+
+        # Columns we need from the shear catalog
+        shear_cols = self.required_shear_columns()
+
+        # Input data.  These are iterators - they lazily load chunks
+        # of the data one by one later when we do the for loop.
+        # This code can be run in parallel, and different processes will
+        # each get different chunks of the data 
+        iter_shear = self.iterate_hdf('shear_catalog', 'metacal', shear_cols, chunk_rows)
+        iter_phot = self.iterate_hdf('photometry_catalog', 'photometry', phot_cols, chunk_rows)
+
+        for (start, end, shear_data), (_, _, phot_data) in zip(iter_shear, iter_phot):
+            # Combine the columns from the two files together in one data
+            data = {**shear_data, **phot_data}
+            yield start, end, data
+
+    def required_columns(self):
+
+        phot_cols = ['g_mag', 'r_mag', 'i_mag']
+
+        return shear_cols, phot_cols
     
 
 
@@ -562,6 +580,21 @@ class TXSelector(PipelineStage):
 
         return sel
 
+class TXSelectorPDF(TXSelector):
+    inputs = [
+        ('shear_catalog', MetacalCatalog),
+        ('calibration_table', TextFile),
+        ('photometry_catalog', HDFFile),
+    ]
+
+    def required_columns(self):
+        shear_cols = ['mcal_flags', 'mcal_psf_T_mean']
+        shear_cols += metacal_variants('mcal_T', 'mcal_s2n', 'mcal_g1', 'mcal_g2')
+        phot_cols = 
+        return cols
+
+
+
 
 def flatten_list(lst):
     return [item for sublist in lst for item in sublist]
@@ -569,3 +602,5 @@ def flatten_list(lst):
 
 if __name__ == '__main__':
     PipelineStage.main()
+
+
