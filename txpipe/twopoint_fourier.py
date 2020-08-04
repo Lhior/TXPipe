@@ -23,132 +23,11 @@ Measurement = collections.namedtuple(
     'Measurement',
     ['corr_type', 'l', 'value', 'win', 'i', 'j'])
 
-class TXTwoPointFourier(PipelineStage):
-    """This Pipeline Stage computes all auto- and cross-correlations
-    for a list of tomographic bins, including all galaxy-galaxy,
-    galaxy-shear and shear-shear power spectra. Sources and lenses
-    both come from the same shear_catalog and tomography_catalog objects.
-
-    The power spectra are computed after deprojecting a number of
-    systematic-dominated modes, represented as input maps.
-
-    In the future we will want to include the following generalizations:
-     - TODO: specify which cross-correlations in particular to include
-             (e.g. which bin pairs and which source/lens combinations).
-     - TODO: include flags for rejected objects. Is this included in
-             the tomography_catalog?
-     - TODO: ell-binning is currently static.
+class NamasterBase:
     """
-    name = 'TXTwoPointFourier'
-    inputs = [
-        ('shear_photoz_stack', HDFFile),  # Photoz stack
-        ('lens_photoz_stack', HDFFile),  # Photoz stack
-        ('fiducial_cosmology', YamlFile),  # For the cosmological parameters
-        ('tracer_metadata', TomographyCatalog),  # For density info
-        ('source_maps', MapsFile),
-        ('density_maps', MapsFile),
-        ('aux_maps', MapsFile),
-        ('mask', MapsFile),
-        ('source_noise_maps', LensingNoiseMaps),
-        ('lens_noise_maps', ClusteringNoiseMaps),
-        ('shear_tomography_catalog', TomographyCatalog),  # For density info
-        ('lens_tomography_catalog', TomographyCatalog),  # For density info
-    ]
-    outputs = [
-        ('twopoint_data_fourier', SACCFile)
-    ]
-
-    config_options = {
-        "mask_threshold": 0.0,
-        "bandwidth": 0,
-        "flip_g1": False,
-        "flip_g2": False,
-        "cache_dir": '',
-    }
-
-    def run(self):
-        import pymaster
-        import healpy
-        import sacc
-        import pyccl
-        config = self.config
-
-        if self.comm:
-            self.comm.Barrier()
-
-        self.setup_results()
-
-
-        # Generate namaster fields
-        pixel_scheme, maps, f_sky = self.load_maps()
-        if self.rank==0:
-            print("Loaded maps.")
-
-        nbin_source = len(maps['g'])
-        nbin_lens = len(maps['d'])
-
-        # Get the complete list of calculations to be done,
-        # for all the three spectra and all the bin pairs.
-        # This will be used for parallelization.
-        calcs = self.select_calculations(nbin_source, nbin_lens)[::-1]
-
-
-        # Load in the per-bin auto-correlation noise levels and 
-        # mean response values
-        # Note - this is currently unused, because we are using the noise
-        # maps instead of an analytic form, but that could change later
-        # so I will leave this here.
-        tomo_info = self.load_tomographic_quantities(nbin_source, nbin_lens, f_sky)
-
-
-        # Binning scheme, currently chosen from the geometry.
-        # TODO: set ell binning from config
-        ell_bins = self.choose_ell_bins(pixel_scheme, f_sky)
-
-        workspaces = self.make_workspaces(maps, calcs, ell_bins)
-
-        # Load the n(z) values, which are both saved in the output
-        # file alongside the spectra, and then used to calcualate the
-        # fiducial theory C_ell, which is used in the deprojection calculation
-        tracers = self.load_tracers(nbin_source, nbin_lens)
-        theory_cl = theory_3x2pt(
-            self.get_input('fiducial_cosmology'),
-            tracers,
-            nbin_source, nbin_lens,
-            fourier=True)
-
-        # If we are rank zero print out some info
-        if self.rank==0:
-            nband = ell_bins.get_n_bands()
-            ell_effs = ell_bins.get_effective_ells()
-            print(f"Chosen {nband} ell bin bands with effective ell values and ranges:")
-            for i in range(nband):
-                leff = ell_effs[i]
-                lmin = ell_bins.get_ell_min(i)
-                lmax = ell_bins.get_ell_max(i)
-                print(f"    {leff:.0f}    ({lmin:.0f} - {lmax:.0f})")
-
-
-        # Run the compute power spectra portion in parallel
-        # This splits the calculations among the parallel bins
-        # It's not the most optimal way of doing it
-        # as it's not dynamic, just a round-robin assignment.
-        for i, j, k in calcs:
-            self.compute_power_spectra(
-                pixel_scheme, i, j, k, maps, workspaces, ell_bins, theory_cl)
-
-        if self.rank==0:
-            print(f"Collecting results together")
-        # Pull all the results together to the master process.
-        self.collect_results()
-
-        # Write the collect results out to HDF5.
-        if self.rank == 0:
-            self.save_power_spectra(tracers, nbin_source, nbin_lens)
-            print("Saved power spectra")
-
-
-
+    This class collects tools that are used in both power-spectrum
+    estimation and covariance estimation.
+    """
     def load_maps(self):
         import pymaster as nmt
         import healpy
@@ -161,6 +40,7 @@ class TXTwoPointFourier(PipelineStage):
             f_sky = info['f_sky']
             mask = f.read_map('mask')
             print("Loaded mask")
+
         # Then the shear maps and weights
         with self.open_input('source_maps', wrapper=True) as f:
             nbin_source = f.file['maps'].attrs['nbin_source']
@@ -258,7 +138,7 @@ class TXTwoPointFourier(PipelineStage):
         for space in spaces.values():
             cache.put(space)
 
-    def make_workspaces(self, maps, calcs, ell_bins):
+    def make_workspaces(self, maps, calcs, ell_bins, covariances=False):
         import pymaster as nmt
 
         # Make the field object
@@ -302,7 +182,8 @@ class TXTwoPointFourier(PipelineStage):
 
         spaces = {}
 
-        def get_workspace(f1, f2):
+
+        def get_workspace(f1, f2, f3=None, f4=None):
             w1, f1 = f1
             w2, f2 = f2
 
@@ -319,24 +200,55 @@ class TXTwoPointFourier(PipelineStage):
             # fields are different.
             if h2 != h1:
                 key ^= h2
+
+            if f3 is not None:
+                w3, f3 = f3
+                w4, f4 = f4
+                h3 = hashes[id(w3)]
+                h4 = hashes[id(w4)]
+
+                key2 = h3 ^ ell_hash
+
+                if h3 != h4:
+                    key2 ^= h4
+                # make sure the keys are always in the same order to avoid
+                # duplication
+                key, key2 = sorted([key, key2])
+                key = f"cov_{key}_{key2}"
+
             # Check on disc to see if we have one saved already.
             space = cache.get(key)
             # If not, compute it.  We will save it later
-            if space is None:
+            if space is not None:
+                if f3 is None:
+                    print(f'Rank {self.rank} getting coupling matrix '
+                           f'{i}, {j}, {k} from cache.')
+                else:
+                    print(f'Rank {self.rank} getting cov coupling matrix '
+                           f'({i1}, {j1}, {k1})-({i2}, {j2}, {k2}) from cache.')
+                new = False
+            elif f3 is None:
                 print(f'Rank {self.rank} computing coupling matrix '
                       f"{i}, {j}, {k}")
                 space = nmt.NmtWorkspace()
                 space.compute_coupling_matrix(f1, f2, ell_bins)
+                new = True
             else:
-                print(f'Rank {self.rank} getting coupling matrix '
-                       f'{i}, {j}, {k} from cache.')
+                print(f"Rank {self.rank} computing covariance coupling "
+                      f"for ({i1},{j1},{k1}) vs ({i2}, {j2}, {k2})"
+                    )
+                space = nmt.NmtCovarianceWorkspace()                
+                space.compute_coupling_coefficients(f1, f2, f3, f4)
+                new = True
             # This is a bit awkward - we attach the key to the
             # object to avoid more book-keeping.  This is used inside
             # the workspace cache
             space.txpipe_key = key
+            if new:
+                cache.put(space)
             return space
 
-        for (i, j, k) in calcs:
+        def choose_field(i, j, k):
             if k == SHEAR_SHEAR:
                 f1 = lensing_fields[i]
                 f2 = lensing_fields[j]
@@ -346,23 +258,23 @@ class TXTwoPointFourier(PipelineStage):
             else:
                 f1 = density_field
                 f2 = density_field
+            return f1, f2
+
+
+        for (i, j, k) in calcs:
+            f1, f2 = choose_field(i, j, k)
             spaces[(i,j,k)] = get_workspace(f1, f2)
 
-        self.save_workspace_cache(cache, spaces)
+        if covariances:
+            for (i1, j1, k1) in calcs[:]:
+                for (i2, j2, k2) in calcs[:]:
+                    f1, f2 = choose_field(i1, j1, k1)
+                    f3, f4 = choose_field(i2, j2, k2)
+
+                    spaces[i1, j1, k1, i2, j2, k2] = get_workspace(f1, f2, f3, f4)
+
+
         return spaces
-
-    def collect_results(self):
-        if self.comm is None:
-            return
-
-        self.results = self.comm.gather(self.results, root=0)
-
-        if self.rank == 0:
-            # Concatenate results
-            self.results = sum(self.results, [])
-
-    def setup_results(self):
-        self.results = []
 
     def choose_ell_bins(self, pixel_scheme, f_sky):
         import pymaster as nmt
@@ -413,6 +325,174 @@ class TXTwoPointFourier(PipelineStage):
         calcs = [calc for calc in self.split_tasks_by_rank(calcs)]
 
         return calcs
+
+    def load_tracers(self, nbin_source, nbin_lens):
+        # Load the N(z) and convert to sacc tracers.
+        # We need this both to put it into the output file,
+        # but also potentially to compute the theory guess
+        # for projecting out modes
+        import sacc
+        f_shear = self.open_input('shear_photoz_stack')
+        f_lens = self.open_input('lens_photoz_stack')
+
+        tracers = {}
+
+        for i in range(nbin_source):
+            name = f"source_{i}"
+            z = f_shear['n_of_z/source/z'][:]
+            Nz = f_shear[f'n_of_z/source/bin_{i}'][:]
+            T = sacc.BaseTracer.make("NZ", name, z, Nz)
+            tracers[name] = T
+
+        for i in range(nbin_lens):
+            name = f"lens_{i}"
+            z = f_lens['n_of_z/lens/z'][:]
+            Nz = f_lens[f'n_of_z/lens/bin_{i}'][:]
+            T = sacc.BaseTracer.make("NZ", name, z, Nz)
+            tracers[name] = T
+
+        return tracers
+
+
+class TXTwoPointFourier(PipelineStage, NamasterBase):
+    """This Pipeline Stage computes all auto- and cross-correlations
+    for a list of tomographic bins, including all galaxy-galaxy,
+    galaxy-shear and shear-shear power spectra. Sources and lenses
+    both come from the same shear_catalog and tomography_catalog objects.
+
+    The power spectra are computed after deprojecting a number of
+    systematic-dominated modes, represented as input maps.
+
+    In the future we will want to include the following generalizations:
+     - TODO: specify which cross-correlations in particular to include
+             (e.g. which bin pairs and which source/lens combinations).
+     - TODO: include flags for rejected objects. Is this included in
+             the tomography_catalog?
+     - TODO: ell-binning is currently static.
+    """
+    name = 'TXTwoPointFourier'
+    inputs = [
+        ('shear_photoz_stack', HDFFile),  # Photoz stack
+        ('lens_photoz_stack', HDFFile),  # Photoz stack
+        ('fiducial_cosmology', YamlFile),  # For the cosmological parameters
+        ('tracer_metadata', TomographyCatalog),  # For density info
+        ('source_maps', MapsFile),
+        ('density_maps', MapsFile),
+        ('aux_maps', MapsFile),
+        ('mask', MapsFile),
+        ('source_noise_maps', LensingNoiseMaps),
+        ('lens_noise_maps', ClusteringNoiseMaps),
+    ]
+    outputs = [
+        ('twopoint_data_fourier', SACCFile)
+    ]
+
+    config_options = {
+        "mask_threshold": 0.0,
+        "bandwidth": 0,
+        "flip_g1": False,
+        "flip_g2": False,
+        "cache_dir": '',
+    }
+
+    def run(self):
+        import pymaster
+        import healpy
+        import sacc
+        import pyccl
+        config = self.config
+
+        if self.comm:
+            self.comm.Barrier()
+
+        self.setup_results()
+
+
+        # Generate namaster fields
+        pixel_scheme, maps, f_sky = self.load_maps()
+        if self.rank==0:
+            print("Loaded maps.")
+
+        nbin_source = len(maps['g'])
+        nbin_lens = len(maps['d'])
+
+        # Get the complete list of calculations to be done,
+        # for all the three spectra and all the bin pairs.
+        # This will be used for parallelization.
+        calcs = self.select_calculations(nbin_source, nbin_lens)
+
+
+        # Load in the per-bin auto-correlation noise levels and 
+        # mean response values
+        # Note - this is currently unused, because we are using the noise
+        # maps instead of an analytic form, but that could change later
+        # so I will leave this here.
+        tomo_info = self.load_tomographic_quantities(nbin_source, nbin_lens, f_sky)
+
+
+        # Binning scheme, currently chosen from the geometry.
+        # TODO: set ell binning from config
+        ell_bins = self.choose_ell_bins(pixel_scheme, f_sky)
+
+        workspaces = self.make_workspaces(maps, calcs, ell_bins)
+
+        # Load the n(z) values, which are both saved in the output
+        # file alongside the spectra, and then used to calcualate the
+        # fiducial theory C_ell, which is used in the deprojection calculation
+        tracers = self.load_tracers(nbin_source, nbin_lens)
+        theory_cl = theory_3x2pt(
+            self.get_input('fiducial_cosmology'),
+            tracers,
+            nbin_source, nbin_lens,
+            fourier=True)
+
+        # If we are rank zero print out some info
+        if self.rank==0:
+            nband = ell_bins.get_n_bands()
+            ell_effs = ell_bins.get_effective_ells()
+            print(f"Chosen {nband} ell bin bands with effective ell values and ranges:")
+            for i in range(nband):
+                leff = ell_effs[i]
+                lmin = ell_bins.get_ell_min(i)
+                lmax = ell_bins.get_ell_max(i)
+                print(f"    {leff:.0f}    ({lmin:.0f} - {lmax:.0f})")
+
+
+        # Run the compute power spectra portion in parallel
+        # This splits the calculations among the parallel bins
+        # It's not the most optimal way of doing it
+        # as it's not dynamic, just a round-robin assignment.
+        for i, j, k in calcs:
+            self.compute_power_spectra(
+                pixel_scheme, i, j, k, maps, workspaces, ell_bins, theory_cl)
+
+        if self.rank==0:
+            print(f"Collecting results together")
+        # Pull all the results together to the master process.
+        self.collect_results()
+
+        # Write the collect results out to HDF5.
+        if self.rank == 0:
+            self.save_power_spectra(tracers, nbin_source, nbin_lens)
+            print("Saved power spectra")
+
+
+
+
+
+    def collect_results(self):
+        if self.comm is None:
+            return
+
+        self.results = self.comm.gather(self.results, root=0)
+
+        if self.rank == 0:
+            # Concatenate results
+            self.results = sum(self.results, [])
+
+    def setup_results(self):
+        self.results = []
+
 
     def compute_power_spectra(self, pixel_scheme, i, j, k, maps, workspaces, ell_bins, cl_theory):
         # Compute power spectra
@@ -548,32 +628,6 @@ class TXTwoPointFourier(PipelineStage):
 
 
 
-    def load_tracers(self, nbin_source, nbin_lens):
-        # Load the N(z) and convert to sacc tracers.
-        # We need this both to put it into the output file,
-        # but also potentially to compute the theory guess
-        # for projecting out modes
-        import sacc
-        f_shear = self.open_input('shear_photoz_stack')
-        f_lens = self.open_input('lens_photoz_stack')
-
-        tracers = {}
-
-        for i in range(nbin_source):
-            name = f"source_{i}"
-            z = f_shear['n_of_z/source/z'][:]
-            Nz = f_shear[f'n_of_z/source/bin_{i}'][:]
-            T = sacc.BaseTracer.make("NZ", name, z, Nz)
-            tracers[name] = T
-
-        for i in range(nbin_lens):
-            name = f"lens_{i}"
-            z = f_lens['n_of_z/lens/z'][:]
-            Nz = f_lens[f'n_of_z/lens/bin_{i}'][:]
-            T = sacc.BaseTracer.make("NZ", name, z, Nz)
-            tracers[name] = T
-
-        return tracers
 
 
 
@@ -625,7 +679,115 @@ class TXTwoPointFourier(PipelineStage):
         S.save_fits(output_filename, overwrite=True)
 
 
-if __name__ == '__main__':
-    PipelineStage.main()
+class TXNamasterCovariance(PipelineStage, NamasterBase):
+    name = "TXNamasterCovariance"
+    inputs = [
+        ('shear_photoz_stack', HDFFile),  # Photoz stack
+        ('lens_photoz_stack', HDFFile),  # Photoz stack
+        ('fiducial_cosmology', YamlFile),  # For the cosmological parameters
+        ('tracer_metadata', TomographyCatalog),  # For density info
+        ('source_maps', MapsFile),
+        ('density_maps', MapsFile),
+        ('aux_maps', MapsFile),
+        ('mask', MapsFile),
+        ('source_noise_maps', LensingNoiseMaps),
+        ('lens_noise_maps', ClusteringNoiseMaps),
+    ]
+    outputs = [
+    ]
+
+    config_options = {
+        "mask_threshold": 0.0,
+        "bandwidth": 0,
+        "flip_g1": False,
+        "flip_g2": False,
+        "cache_dir": '',
+    }
+
+    def run(self):
+        import pymaster
+        import healpy
+        import sacc
+        import pyccl
 
 
+
+        # Generate namaster fields
+        pixel_scheme, maps, f_sky = self.load_maps()
+
+        # Bin counts
+        nbin_source = len(maps['g'])
+        nbin_lens = len(maps['d'])
+
+        # Set up things
+        calcs = self.select_calculations(nbin_source, nbin_lens)
+        ell_bins = self.choose_ell_bins(pixel_scheme, f_sky)
+        tracers = self.load_tracers(nbin_source, nbin_lens)
+        workspaces = self.make_workspaces(maps, calcs, ell_bins, covariances=True)
+
+        theory_cl = theory_3x2pt(self.get_input('fiducial_cosmology'),
+                                 tracers,
+                                 nbin_source,
+                                 nbin_lens,
+                                 fourier=True)
+
+        pairs = self.select_blocks(calcs)
+
+        my_pairs = [pair for pair in self.split_tasks_by_rank(pairs)]
+        print(f"Rank {self.rank} computing {len(my_pairs)} covariance blocks")
+
+        for block1, block2 in my_pairs:
+            self.compute_covariance_block(block1, block2, theory_cl, workspaces)
+
+
+    def select_blocks(self, calcs):
+        pairs = []
+        for block1 in calcs[:]:
+            for block2 in calcs[:]:
+                if block1 >= block2:
+                    pairs.append((block1, block2))
+        return pairs
+
+    def compute_covariance_block(self, block1, block2, theory_cl, workspaces):
+        print(f"Rank {self.rank} computing block {block1} - {block2}")
+        i1, j1, k1 = block1
+        i2, j2, k2 = block2
+
+        s11 = 0 if k1 == POS_POS else 2
+        s12 = 2 if k1 == SHEAR_SHEAR else 0
+        s21 = 0 if k2 == POS_POS else 2
+        s22 = 2 if k2 == SHEAR_SHEAR else 0
+
+        w1 = spaces[i1, j1, k1]
+        w2 = spaces[i2, j2, k2]
+
+        cw = spaces[i1, j1, k1, i2, j2, k2]
+
+        map1 = {
+            0: ("E", "E"),
+            1: ("E", "T"),
+            2: ("T", "T"),
+        }
+        a1, b1 = d[k1]
+        a2, b2 = d[k2]
+
+        def get_cl(a, b, i, j):
+            map2 = {
+                "EE": (i, j, SHEAR_SHEAR),
+                "TE": (i, j, SHEAR_POS),
+                "ET": (j, i, SHEAR_POS), # note the flip in i,j
+                "TT": (i, j, POS_POS),
+            }
+            return theory_cl[map2[a + b]]
+
+        c11 = get_cl(a1, a2, i1, i2)
+        c12 = get_cl(a1, b2, i1, j2)
+        c21 = get_cl(b1, a2, j1, i2)
+        c22 = get_cl(b1, b2, j1, j2)
+
+
+        cov_block = nmt.gaussian_covariance(cw,
+                                    s11, s12, s21, s22,  # Spins of the 4 fields
+                                    c11, c12, c21, c22,
+                                    w1, w2)
+        return cov_block

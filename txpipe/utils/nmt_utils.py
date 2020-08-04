@@ -72,7 +72,10 @@ class WorkspaceCache:
 
         # Initialize a workspace and populate
         # it from file
-        workspace = nmt.NmtWorkspace()
+        if "cov" in str(key):
+            workspace = nmt.NmtCovarianceWorkspace()
+        else:
+            workspace = nmt.NmtWorkspace()
         workspace.read_from(str(p))
 
         self._loaded[key] = workspace
