@@ -269,6 +269,7 @@ class TXCosmoDC2Mock(PipelineStage):
 
         # Make group for all the photometry
         group = metacal_file.create_group('shear')
+        group.attrs['catalog_type'] = 'metacal'
 
         # Extensible columns becase we don't know the size yet.
         # We will cut down the size at the end.
@@ -635,6 +636,7 @@ class TXCosmoDC2MockMetadetect(TXCosmoDC2Mock):
         target_size *= 5
         # Make group for all the photometry
         group = metacal_file.create_group('shear')
+        group.attrs['catalog_type'] = 'metadetect'
 
         # Float-type columns
         cols = ['ra', 'dec', 'psf_g1', 'psf_g2', 'mcal_psf_g1', 'mcal_psf_g2',
