@@ -201,13 +201,13 @@ class TXCosmoDC2Mock(PipelineStage):
         if self.rank == 0:
             # all files should now be closed for all procs
             print(f"Resizing all outupts to size {n}")
-            f = h5py.File(self.get_output('photometry_catalog'))
+            f = h5py.File(self.get_output('photometry_catalog'), "r+")
             g = f['photometry']
             for col in list(g.keys()):
                 g[col].resize((n,))
             f.close()
 
-            f = h5py.File(self.get_output('shear_catalog'))
+            f = h5py.File(self.get_output('shear_catalog'), "r+")
             g = f['shear']
             for col in g.keys():
                 g[col].resize((n,))
@@ -618,6 +618,7 @@ class TXCosmoDC2Mock(PipelineStage):
             data[key] = data[key][detected]
 
 class TXCosmoDC2MockMetadetect(TXCosmoDC2Mock):
+    name = "TXCosmoDC2MockMetadetect"
     """
     Subclass of the CosmoDC2 extractor designed to make a mock metadetection
     file.  For now, we don't simulate the actual metadetection process by removing
@@ -655,14 +656,13 @@ class TXCosmoDC2MockMetadetect(TXCosmoDC2Mock):
         group.create_dataset('mcal_flags', (target_size,), maxshape=(target_size,), dtype='i8')
         group.create_dataset("shear_type", (target_size,), maxshape=(target_size,), dtype="S2")
 
-        return cols + ['id',  'mcal_flags' + 'shear_type']
+        return cols + ['id',  'mcal_flags', 'shear_type']
 
 
     def write_output(self, start, target_size, photo_cols, metacal_cols, photo_file, photo_data, metacal_file, metacal_data):
         # Photo output is the same as for metacal version
         n = len(photo_data['id'])
         end = min(start + n, target_size)
-
 
         for name in photo_cols:
             photo_file[f'photometry/{name}'][start:end] = photo_data[name]
@@ -699,14 +699,14 @@ class TXCosmoDC2MockMetadetect(TXCosmoDC2Mock):
         if self.rank == 0:
             # all files should now be closed for all procs
             print(f"Resizing all outupts to size {n}")
-            f = h5py.File(self.get_output('photometry_catalog'))
+            f = h5py.File(self.get_output('photometry_catalog'), "r+")
             g = f['photometry']
             for col in list(g.keys()):
                 g[col].resize((n,))
             f.close()
 
             shear_n = 5 * n
-            f = h5py.File(self.get_output('shear_catalog'))
+            f = h5py.File(self.get_output('shear_catalog'), "r+")
             g = f['shear']
             for col in g.keys():
                 g[col].resize((shear_n,))
