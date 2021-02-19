@@ -617,6 +617,100 @@ class TXCosmoDC2Mock(PipelineStage):
         for key in list(data.keys()):
             data[key] = data[key][detected]
 
+class TXCosmoDC2MockMetadetect(TXCosmoDC2Mock):
+    """
+    Subclass of the CosmoDC2 extractor designed to make a mock metadetection
+    file.  For now, we don't simulate the actual metadetection process by removing
+    any objects from some versions, but that is the next step.
+
+    This is very similar to the parent method except that we change the output
+    format 
+    """
+    def setup_metacal_output(self, metacal_file, target_size):
+        # This overr
+        # size of the metadetect catalog does not have the metacal variant columns,
+        # but is 5 times longer, because they go into sepatate rows
+        # 
+        target_size *= 5
+        # Make group for all the photometry
+        group = metacal_file.create_group('shear')
+
+        # Float-type columns
+        cols = ['ra', 'dec', 'psf_g1', 'psf_g2', 'mcal_psf_g1', 'mcal_psf_g2',
+                'mcal_psf_T_mean', 'mcal_g1', 'mcal_g2', 'mcal_T', 'mcal_s2n',
+                'mcal_T_err', 'weight', 'true_g1', 'true_g2']
+
+        # setting shear_catalog_type here is really just to stop it from
+        # doing all the 1p 1m variants - the function just checks if it's metacal
+        cols += band_variants('riz', 'mcal_mag', 'mcal_mag_err',
+                              shear_catalog_type='metadetect')
+
+        # Extensible columns becase we don't know the size yet.
+        # We will cut down the size at the end.
+        for col in cols:
+            group.create_dataset(col, (target_size,), maxshape=(target_size,), dtype='f8')
+
+        # Non-float cols
+        group.create_dataset('id', (target_size,), maxshape=(target_size,), dtype='i8')
+        group.create_dataset('mcal_flags', (target_size,), maxshape=(target_size,), dtype='i8')
+        group.create_dataset("shear_type", (target_size,), maxshape=(target_size,), dtype="S2")
+
+        return cols + ['id',  'mcal_flags' + 'shear_type']
+
+
+    def write_output(self, start, target_size, photo_cols, metacal_cols, photo_file, photo_data, metacal_file, metacal_data):
+        # Photo output is the same as for metacal version
+        n = len(photo_data['id'])
+        end = min(start + n, target_size)
+
+
+        for name in photo_cols:
+            photo_file[f'photometry/{name}'][start:end] = photo_data[name]
+
+        meta_start = start * 5
+
+        # If we are cutting down the catalog and so cutting off the final
+        # chunk of this data set then we need to throw away the last few objects
+        meta_end = meta_start + 5 * n
+        if meta_end > 5 * target_size:
+            n -= (meta_end - 5 * target_size) // 5
+
+        for i, shear_type in enumerate(['', '1p', '1m', '2p', '2m']):
+            s = meta_start + i * n
+            e = s + n
+            for name in metacal_cols:
+                meta_name = f"{name}_{shear_type}"
+                # The special shear_type col
+                if name == "shear_type":
+                    metacal_file[f'shear/{name}'][s:e] = shear_type
+                # metacalibrated columns
+                elif meta_name in metacal_data:
+                    metacal_file[f'shear/{name}'][s:e] = metacal_data[meta_name]
+                # other columns e.g. truth information, just cloned
+                else:
+                    metacal_file[f'shear/{name}'][s:e] = metacal_data[name]
+
+
+    def truncate_outputs(self, n):
+        import h5py
+        if self.comm is not None:
+            self.comm.Barrier()
+
+        if self.rank == 0:
+            # all files should now be closed for all procs
+            print(f"Resizing all outupts to size {n}")
+            f = h5py.File(self.get_output('photometry_catalog'))
+            g = f['photometry']
+            for col in list(g.keys()):
+                g[col].resize((n,))
+            f.close()
+
+            shear_n = 5 * n
+            f = h5py.File(self.get_output('shear_catalog'))
+            g = f['shear']
+            for col in g.keys():
+                g[col].resize((shear_n,))
+
 class TXBuzzardMock(TXCosmoDC2Mock):
     """
     This stage simulates metacal data and metacalibrated
