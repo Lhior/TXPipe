@@ -13,18 +13,29 @@ python_paths:
 
 stages:
     - name: TXSourceSelector
+      nprocess: 64
+      nodes: 2
     - name: TXSourceMaps
+      nprocess: 16
+      nodes: 2
     - name: TXAuxiliaryMaps
+      nprocess: 16
+      nodes: 2
     - name: TXSimpleMask
     - name: TXSourceTrueNumberDensity
+      nprocess: 64
+      nodes: 2
     - name: TXIngestRedmagic
     - name: TXPhotozPlots
     - name: TXTracerMetadata
     - name: TXRandomCat
     - name: TXJackknifeCenters
     - name: TXTwoPointLensCat
+      nprocess: 4
+      threads_per_process: 32
     - name: TXNullBlinding
     - name: TXRealGaussianCovariance
+      threads_per_process: 32
     - name: TXTwoPointTheoryReal
     - name: TXTwoPointPlots
 
