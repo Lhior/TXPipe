@@ -60,9 +60,9 @@ TXTwoPointLensCat:
     min_sep: 2.5
     max_sep: 100
     nbins: 15
-    verbose: 0
+    verbose: 1
     use_true_shear: True
-    subtract_mean_shear: True
+    subtract_mean_shear: False
     var_method: jackknife
 
 TXNullBlinding: {}
